@@ -18,23 +18,30 @@ guarantees decent overlap.
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
 #include <math.h>
 #include "wave.h"
 
 #define MIN_FREQ 65
-#define MAX_FREQ 400
+#define MAX_FREQ 135
 static int minPeriod, maxPeriod;
-static float speed;
+static double speed;
 static int inputPos = 0, outputPos = 0;
+static double exactInputPos = 0.0;
 static short *inputSamples, *outputSamples;
 static int inputLength, outputLength;
-static int period, nextPeriod;
-static float *filter, *nextFilter;
-static int filterPos = 0, nextFilterPos = 0;
+static int period, prevPeriod, stepSize;
+static double *filter, *prevFilter;
+static int filterPos = 0, prevFilterPos = 0;
 static int sampleRate, numChannels;
+static bool prevPeriodVoiced = false;
+
+#define min(a, b) ((a) <= (b)? (a) : (b))
+#define max(a, b) ((a) >= (b)? (a) : (b))
 
 static inline short clamp(
-    float value)
+    double value)
 {
     int intVal = round(value);
 
@@ -46,120 +53,176 @@ static inline short clamp(
     return (short)intVal;
 }
 
-// Find the best frequency match in the range.
+// Find the best frequency match.  This routine looks for a pitch period just
+// prior to the samples pointer which matches one just after it, so samples
+// should be valid for at least maxPeriod samples as a negative index, as
+// well as a positive index.
 static int findPitchPeriod(
     short *samples)
 {
     int period, bestPeriod = 0;
     short *s, *p, sVal, pVal;
     long long diff, minDiff = 1;
-    int i;
+    long long totalDiff = 0, aveDiff;
+    int i, start, stop;
 
-    for(period = minPeriod; period <= maxPeriod; period++) {
+    if(prevPeriodVoiced) {
+        start = max(minPeriod, (prevPeriod*2)/3);
+        stop = min(maxPeriod, (prevPeriod*3)/2);
+    } else {
+        start = minPeriod;
+        stop = maxPeriod;
+    }
+    for(period = start; period <= stop; period++) {
 	diff = 0;
-	s = samples;
-	p = samples + period;
+	s = samples - period;
+	p = samples;
 	for(i = 0; i < period; i++) {
 	    sVal = *s++;
 	    pVal = *p++;
 	    diff += sVal >= pVal? sVal - pVal : pVal - sVal;
 	}
+        totalDiff += diff/period;
 	if(diff*bestPeriod < minDiff*period) {
 	    minDiff = diff;
 	    bestPeriod = period;
 	}
     }
+    aveDiff = totalDiff/(stop - start);
+    printf("Period %d, minDiff %lld, aveDiff %lld", bestPeriod,
+        minDiff/bestPeriod, aveDiff);
+    prevPeriodVoiced = minDiff/bestPeriod <= aveDiff/2 && aveDiff > 100;
+    if(prevPeriodVoiced) {
+        printf(", voiced\n");
+    } else {
+        printf("\n");
+    }
     return bestPeriod;
 }
 
-// Compute the filter at the new filter point, one period in the future from the
-// playbackPos.
-static void computeNextFilter(void)
+// Compute the filter at the next filter point, one step in the future from
+// inputPos.
+static void computeFilter(
+    short *samples,
+    int period)
 {
-    float *f = nextFilter;
-    short *p = inputSamples + inputPos;
-    short *q = inputSamples + inputPos + nextPeriod;
+    double *f = filter;
+    short *p = samples - period;
+    short *q = samples;
     int i;
-    float ratio;
+    double ratio;
 
-    for(i = 0; i < nextPeriod; i++) {
-        ratio = i/(float)nextPeriod;
-        *f++ = (ratio)*(*p++) + (1.0f - ratio)*(*q++);
+    for(i = 0; i < period; i++) {
+        ratio = i/(double)period;
+        *f++ = (ratio)*(*p++) + (1.0 - ratio)*(*q++);
     }
-    // Now compute the next filter position.
-    nextFilterPos = filterPos - nextPeriod;
-    if(nextFilterPos < 0) {
-        nextFilterPos += nextPeriod;
+    // Now compute the filter position.
+    filterPos = prevFilterPos - stepSize;
+    while(filterPos < 0) {
+        filterPos += period;
     }
-    while(nextFilterPos >= nextPeriod) {
-        nextFilterPos -= nextPeriod;
+    while(filterPos >= period) {
+        filterPos -= period;
     }
 }
 
-// Ramp down the current filter while ramping up the next.
+// Ramp down the previous filter while ramping up the next.
 static void playFilters()
 {
-    int length = nextPeriod/speed;
-    int i;
-    float ratio;
+    double ratio;
+    int numGenerated = 0;
 
-    //printf("Playing %d samples for period of %d.\n", length, nextPeriod);
-    for(i = 0; i < length; i++) {
-        ratio = i/(float)length;
-        outputSamples[outputPos++] = clamp((1.0f - ratio)*filter[filterPos] +
-            ratio*nextFilter[nextFilterPos]);
+    do {
+        ratio = (exactInputPos - inputPos)/stepSize;
+        if(ratio < 0.0 || ratio > 1.0) {
+            printf("Bad ratio = %f\n", ratio);
+            exit(1);
+        }
+        outputSamples[outputPos++] = clamp((1.0 - ratio)*prevFilter[prevFilterPos] +
+            ratio*filter[filterPos]);
+        if(++prevFilterPos == prevPeriod) {
+            prevFilterPos = 0;
+        }
         if(++filterPos == period) {
             filterPos = 0;
         }
-        if(++nextFilterPos == nextPeriod) {
-            nextFilterPos = 0;
+        numGenerated++;
+        exactInputPos += speed;
+    } while(exactInputPos - inputPos < stepSize);
+    //printf("Generated %d samples for period of %d.\n", numGenerated, period);
+
+/*
+    int length = stepSize/speed;
+    int i;
+    double ratio;
+
+    //printf("Playing %d samples for period of %d.\n", length, period);
+    for(i = 0; i < length; i++) {
+        ratio = i/(double)length;
+        outputSamples[outputPos++] = clamp((1.0 - ratio)*prevFilter[prevFilterPos] +
+            ratio*filter[filterPos]);
+        if(++prevFilterPos == prevPeriod) {
+            prevFilterPos = 0;
+        }
+        if(++filterPos == period) {
+            filterPos = 0;
         }
     }
-    inputPos += nextPeriod;
+*/
 }
 
-//  Generate samples until the current playback point has passed the next filter
-//  location.
+// Generate samples until the current playback point has passed the next filter
+// location.  We assume we have already computed the current filter and it's
+// period, and now need to compute the step size and compute the new one.
 static void generateSamplesForOneStep(void)
 {
-    float *temp;
+    double *temp;
 
-    period = nextPeriod;
-    temp = filter;
-    filter = nextFilter;
-    nextFilter = temp;
-    filterPos = nextFilterPos;
-    nextPeriod = findPitchPeriod(inputSamples + inputPos);
-    computeNextFilter();
+    //stepSize = period/2;
+    stepSize = period;
+    prevPeriod = period;
+    temp = prevFilter;
+    prevFilter = filter;
+    filter = temp;
+    prevFilterPos = filterPos;
+    period = findPitchPeriod(inputSamples + inputPos + stepSize);
+    computeFilter(inputSamples + inputPos + stepSize, period);
     playFilters();
+    inputPos += stepSize;
 }
 
 // Play until out of input data.
 static void playAll(void)
 {
-    while(inputPos + 2*maxPeriod < inputLength) {
+    inputPos = maxPeriod; // Skip initial zeros.
+    exactInputPos = maxPeriod;
+    period = minPeriod;
+    while(inputPos < inputLength) {
         generateSamplesForOneStep();
     }
 }
 
-// Read an input wave file.
+// Read an input wave file.  This function pads the beginning and end with
+// maxPeriod zeros.
 static void readWaveFile(
     char *fileName)
 {
-    int inputSize = 1024;
+    int inputSize = 1024 + 2*maxPeriod;
     int samplesRead;
     waveFile inFile = openInputWaveFile(fileName, &sampleRate, &numChannels);
 
     inputSamples = (short *)calloc(inputSize, sizeof(short));
+    inputLength = maxPeriod;
     do {
         samplesRead = readFromWaveFile(inFile, inputSamples + inputLength, 1024);
         inputLength += samplesRead;
-        if(inputLength + 1024 >= inputSize) {
+        if(inputLength + 1024 + 2*maxPeriod >= inputSize) {
             inputSize *= 2;
             inputSamples = (short *)realloc(inputSamples, inputSize*sizeof(short));
         }
     } while(samplesRead > 0);
     closeWaveFile(inFile);
+    memset(inputSamples + inputLength, 0, maxPeriod);
 }
 
 // Write to the output wave file.
@@ -183,8 +246,9 @@ int main(int argc, char **argv)
     maxPeriod = sampleRate/MIN_FREQ;
     printf("Length = %d, sample rate = %d Hz\n", inputLength, sampleRate);
     period = minPeriod;
-    filter = (float *)calloc(maxPeriod, sizeof(float));
-    nextFilter = (float *)calloc(maxPeriod, sizeof(float));
+    stepSize = minPeriod/2;
+    prevFilter = (double *)calloc(maxPeriod, sizeof(double));
+    filter = (double *)calloc(maxPeriod, sizeof(double));
     outputLength = inputLength/speed + 4096;
     outputSamples = (short *)calloc(outputLength, sizeof(short));
     playAll();
