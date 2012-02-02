@@ -40,19 +40,6 @@ static bool prevPeriodVoiced = false;
 #define min(a, b) ((a) <= (b)? (a) : (b))
 #define max(a, b) ((a) >= (b)? (a) : (b))
 
-static inline short clamp(
-    double value)
-{
-    int intVal = round(value);
-
-    if(intVal > 32767) {
-        intVal = 32767;
-    } else if(intVal < -32767) {
-        intVal = -32767;
-    }
-    return (short)intVal;
-}
-
 // Find the best frequency match.  This routine looks for a pitch period just
 // prior to the samples pointer which matches one just after it, so samples
 // should be valid for at least maxPeriod samples as a negative index, as
@@ -138,8 +125,7 @@ static void playFilters()
             printf("Bad ratio = %f\n", ratio);
             exit(1);
         }
-        outputSamples[outputPos++] = clamp((1.0 - ratio)*prevFilter[prevFilterPos] +
-            ratio*filter[filterPos]);
+        outputSamples[outputPos++] = (1.0 - ratio)*prevFilter[prevFilterPos] + ratio*filter[filterPos];
         if(++prevFilterPos == prevPeriod) {
             prevFilterPos = 0;
         }
@@ -150,25 +136,6 @@ static void playFilters()
         exactInputPos += speed;
     } while(exactInputPos - inputPos < stepSize);
     //printf("Generated %d samples for period of %d.\n", numGenerated, period);
-
-/*
-    int length = stepSize/speed;
-    int i;
-    double ratio;
-
-    //printf("Playing %d samples for period of %d.\n", length, period);
-    for(i = 0; i < length; i++) {
-        ratio = i/(double)length;
-        outputSamples[outputPos++] = clamp((1.0 - ratio)*prevFilter[prevFilterPos] +
-            ratio*filter[filterPos]);
-        if(++prevFilterPos == prevPeriod) {
-            prevFilterPos = 0;
-        }
-        if(++filterPos == period) {
-            filterPos = 0;
-        }
-    }
-*/
 }
 
 // Generate samples until the current playback point has passed the next filter
